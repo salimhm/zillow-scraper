@@ -163,10 +163,10 @@ CELERY_TIMEZONE = TIME_ZONE
 SCRAPER_SETTINGS = {
     'PROXIES': config('PROXIES', default='', cast=Csv()),
     'USER_AGENTS': config('USER_AGENTS', default='', cast=Csv()),
-    'REQUEST_DELAY_MIN': config('REQUEST_DELAY_MIN', default=1.0, cast=float),
-    'REQUEST_DELAY_MAX': config('REQUEST_DELAY_MAX', default=3.0, cast=float),
+    'REQUEST_DELAY_MIN': config('REQUEST_DELAY_MIN', default=0, cast=float),
+    'REQUEST_DELAY_MAX': config('REQUEST_DELAY_MAX', default=0, cast=float),
     'REQUEST_TIMEOUT': config('REQUEST_TIMEOUT', default=30, cast=int),
-    'MAX_RETRIES': config('MAX_RETRIES', default=3, cast=int),
+    'MAX_RETRIES': config('MAX_RETRIES', default=10, cast=int),
 }
 
 # Logging
