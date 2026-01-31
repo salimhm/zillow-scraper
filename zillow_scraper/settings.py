@@ -159,7 +159,7 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
-# Scraper settings
+## Scraper settings
 SCRAPER_SETTINGS = {
     'PROXIES': config('PROXIES', default='', cast=Csv()),
     'USER_AGENTS': config('USER_AGENTS', default='', cast=Csv()),
