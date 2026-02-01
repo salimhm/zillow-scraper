@@ -99,7 +99,8 @@ class AgentScraper(BaseScraper):
                         pass
             
             # Fallback: Parse profile links directly from HTML
-            if not agents:
+            # Fallback: Parse profile links directly from HTML
+            if not agents_result['results']:
                 logger.info("No agents found in scripts, parsing profile links...")
                 profile_links = soup.select('a[href*="/profile/"]')
                 
@@ -121,7 +122,7 @@ class AgentScraper(BaseScraper):
                             name = agent_slug.replace('-', ' ').title()
                             full_url = href if href.startswith('http') else f"{self.BASE_URL}{href}"
                             
-                            agents.append({
+                            agents_result['results'].append({
                                 'name': name,
                                 'url': full_url,
                                 'photo_url': '',
@@ -134,14 +135,16 @@ class AgentScraper(BaseScraper):
                                 'is_team': False,
                             })
                 
-                logger.info(f"Found {len(agents)} agents from profile links")
+                logger.info(f"Found {len(agents_result['results'])} agents from profile links")
             
-            if not agents:
+            if not agents_result['results']:
                 raise NotFoundException(f"No agents found for location: {location}")
             
             return {
                 'source_url': url,
-                'results': agents
+                'results': agents_result['results'],
+                'total_results': agents_result.get('total_results', len(agents_result['results'])),
+                'current_page': page
             }
             
         except NotFoundException:
