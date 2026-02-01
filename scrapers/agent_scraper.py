@@ -724,6 +724,61 @@ class AgentScraper(BaseScraper):
             logger.error(f"Failed to get agent reviews: {e}")
             raise ScraperException(f"Failed to get agent reviews: {e}")
     
+    def _extract_zuid(self, script_data: Dict, soup: Any) -> Optional[str]:
+        """Extract encodedZuid from script data or soup."""
+        # Try JSON path
+        if script_data:
+            props = script_data.get('props', {}).get('pageProps', {})
+            agent = props.get('agent', {}) or props.get('agentDirectoryFinderDisplay', {}).get('agent', {})
+            zuid = agent.get('encodedZuid') or agent.get('zuid')
+            if zuid:
+                return zuid
+        
+        # Fallback regex
+        if soup:
+            text = str(soup)
+            match = re.search(r'"encodedZuid":"([^"]+)"', text) or re.search(r'"zuid":"([^"]+)"', text)
+            if match:
+                return match.group(1)
+        return None
+
+    def _fetch_agent_listings_api(self, zuid: str, property_type: str, page: int = 1) -> Dict[str, Any]:
+        """Fetch agent listings from internal API."""
+        endpoint_map = {
+            'for-sale': 'active-listings',
+            'for-rent': 'rental-listings',
+            'sold': 'past-sales'
+        }
+        endpoint = endpoint_map.get(property_type, 'active-listings')
+        
+        # API URL
+        api_url = f"https://www.zillow.com/profile-page/api/public/v1/{endpoint}"
+        params = {
+            'encodedZuid': zuid,
+            'page': page,
+            'include_team': 'true',
+            'perPage': 40,
+            'limit': 40
+        }
+        
+        try:
+            # Add delay to avoid rate limits
+            self._delay()
+            
+            logger.info(f"Fetching properties from API: {api_url} with params {params}")
+            # Use _make_request from BaseScraper
+            response = self._make_request(api_url, params=params)
+                
+            if response.status_code == 200:
+                data = response.json()
+                return data
+            logger.warning(f"API request failed: {response.status_code} {response.text}")
+        except Exception as e:
+            logger.error(f"API request exception: {e}")
+            
+        return {}
+
+
     def get_agent_properties(
         self,
         agentname: str = None,
@@ -775,11 +830,31 @@ class AgentScraper(BaseScraper):
 
             properties = []
             total_properties = 0
+            listings = []
             
-            # Try script data
+            # Extract script data
             script_data = extract_json_from_script(soup)
-            if script_data:
-                # Map property type to Next.js prop keys (based on debug findings)
+            
+            # 1. Try Internal API (Preferred)
+            zuid = self._extract_zuid(script_data, soup)
+            if zuid:
+                logger.info(f"Found ZUID: {zuid}, attempting internal API fetch")
+                api_data = self._fetch_agent_listings_api(zuid, property_type, page)
+                if api_data:
+                    # Handle different response keys for different endpoints
+                    # active-listings/rental-listings use 'listings' and 'listing_count'
+                    # past-sales uses 'past_sales' and 'total'
+                    api_listings = api_data.get('listings') or api_data.get('past_sales') or []
+                    api_total = api_data.get('listing_count') or api_data.get('total') or 0
+                    
+                    if api_listings:
+                        listings = api_listings
+                        total_properties = api_total or len(listings)
+                        logger.info(f"API fetch successful: {len(listings)} listings, {total_properties} total")
+
+            # 2. Fallback to Script Data (Next.js props) if API failed
+            if not listings and script_data:
+                # Map property type to Next.js prop keys
                 prop_keys = {
                     'for-sale': ['forSaleListings', 'listings', 'properties'],
                     'for-rent': ['forRentListings', 'listings', 'properties'],
@@ -787,28 +862,53 @@ class AgentScraper(BaseScraper):
                 }
                 
                 target_keys = prop_keys.get(property_type, ['listings'])
-                listings = []
                 
                 for key in target_keys:
                     found = script_data.get(key)
                     if found:
-                        # Handle if found is a dict with 'listings' or 'past_sales' (common in Next.js)
+                        logger.info(f"Found property data under key '{key}'")
                         if isinstance(found, dict):
+                            logger.info(f"Keys in '{key}': {list(found.keys())}")
                             listings = found.get('listings') or found.get('past_sales') or []
                             total_properties = found.get('totalCount') or found.get('totalResultCount') or found.get('count') or 0
+                            logger.info(f"Extracted total_properties: {total_properties}")
                         elif isinstance(found, list):
                             listings = found
+                            total_properties = len(found)
                         
                         if listings:
                             break
-                        
-                for listing in listings:
-                    parsed = parse_property_card(listing)
-                    if parsed:
-                        properties.append(parsed)
             
-            # Fallback: Parse HTML
-            if not properties:
+            # Fallback: Parse total count from HTML text (e.g., "Sold (3254)")
+            if total_properties == 0 or total_properties == len(listings):
+                 # Look for headers like "Sold (3254)", "Rentals (13)", "For Sale (10)"
+                 labels = []
+                 if property_type == 'sold':
+                     labels = ['Sold', 'Past Sales']
+                 elif property_type == 'for-rent':
+                     labels = ['For Rent', 'Rentals', 'Active Rentals']
+                 else:
+                     labels = ['For Sale', 'Active Listings', 'Listings']
+                 
+                 # Create combined regex: (Sold|Past Sales)\s*\((\d+)\)
+                 label_pattern = '|'.join(map(re.escape, labels))
+                 count_pattern = re.compile(rf'({label_pattern})\s*\((\d+)\)', re.IGNORECASE)
+                 
+                 for elem in soup.find_all(['h2', 'h3', 'span', 'div', 'button']):
+                     text = elem.get_text().strip()
+                     match = count_pattern.search(text)
+                     if match:
+                         total_properties = int(match.group(2))
+                         logger.info(f"Extracted total_properties from HTML: {total_properties} (matched '{match.group(1)}')")
+                         break
+                         
+            for listing in listings:
+                parsed = parse_property_card(listing)
+                if parsed:
+                    properties.append(parsed)
+            
+            # Fallback: Parse HTML if no properties found (and no JSON listings)
+            if not properties and not listings:
                 property_cards = soup.select('[data-test="property-card"], .property-card, .list-card')
                 for card in property_cards:
                     # Extract basic info
@@ -820,11 +920,10 @@ class AgentScraper(BaseScraper):
                         properties.append({
                             'zpid': None,
                             'address': clean_text(address_elem.get_text()),
-                            'url': link_elem.get('href', '') if link_elem else '',
-                            'price': None,
-                            'beds': None,
-                            'baths': None,
-                            'sqft': None,
+                            'price': clean_text(price_elem.get_text()) if price_elem else None,
+                            'url': f"{self.BASE_URL}{link_elem['href']}" if link_elem else None,
+                            'property_type': property_type,
+                            'status': None
                         })
             
             if not properties:
@@ -833,11 +932,23 @@ class AgentScraper(BaseScraper):
             if total_properties == 0 and properties:
                 total_properties = len(properties)
                 
+            # Determine per_page based on listings count if explicit
+            per_page = 40
+            if zuid and listings:
+                 current_count = len(listings)
+                 # If using API, the returned count is likely the page size (unless it's the last page)
+                 # Heuristic: If we have more total results than what would cover the current page count
+                 if current_count > 0 and total_properties > (page * current_count):
+                      per_page = current_count
+                 elif current_count > 0 and page == 1:
+                      per_page = current_count # First page defines page size regardless of total
+
             return {
                 'source_url': profile_url,
                 'results': properties,
                 'total_results': total_properties,
-                'current_page': page
+                'current_page': page,
+                'per_page': per_page
             }
             
         except NotFoundException:

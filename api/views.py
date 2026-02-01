@@ -236,7 +236,8 @@ def agent_for_sale_properties(request):
     return Response(build_paginated_response(
         results=serializer.data,
         total_results=result.get('total_results', len(result['results'])),
-        current_page=result.get('current_page', page)
+        current_page=result.get('current_page', page),
+        per_page=result.get('per_page', 40)
     ))
 
 
@@ -286,7 +287,8 @@ def agent_for_rent_properties(request):
     return Response(build_paginated_response(
         results=serializer.data,
         total_results=result.get('total_results', len(result['results'])),
-        current_page=result.get('current_page', page)
+        current_page=result.get('current_page', page),
+        per_page=result.get('per_page', 40)
     ))
 
 
@@ -336,7 +338,8 @@ def agent_sold_properties(request):
     return Response(build_paginated_response(
         results=serializer.data,
         total_results=result.get('total_results', len(result['results'])),
-        current_page=result.get('current_page', page)
+        current_page=result.get('current_page', page),
+        per_page=result.get('per_page', 40)
     ))
 
 
