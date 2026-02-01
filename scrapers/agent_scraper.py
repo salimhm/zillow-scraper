@@ -173,8 +173,15 @@ class AgentScraper(BaseScraper):
             
             search_results = agent_display.get('searchResults', {})
             
+            # If total_results is 0, try to get it from search_results['resultsFound']
+            if total_results == 0 and search_results:
+                total_results = search_results.get('resultsFound', 0)
+                
             if search_results:
                 logger.info(f"Found searchResults with keys: {list(search_results.keys())[:10]}")
+                # Update current_page from search_results if available
+                if search_results.get('currentPage'):
+                    current_page = search_results.get('currentPage')
         except Exception as e:
             logger.debug(f"Path navigation failed: {e}")
         
@@ -200,7 +207,11 @@ class AgentScraper(BaseScraper):
                                     if parsed:
                                         agents.append(parsed)
                                 if agents:
-                                    return agents
+                                    return {
+                                        'results': agents,
+                                        'total_results': total_results,
+                                        'current_page': current_page
+                                    }
                     elif isinstance(agent_list, list) and len(agent_list) > 0:
                         logger.info(f"Found {len(agent_list)} items under '{key}'")
                         if isinstance(agent_list[0], dict):
@@ -210,7 +221,11 @@ class AgentScraper(BaseScraper):
                             if parsed:
                                 agents.append(parsed)
                         if agents:
-                            return agents
+                            return {
+                                'results': agents,
+                                'total_results': total_results,
+                                'current_page': current_page
+                            }
         
         # Try other top-level paths
         paths_to_try = [
@@ -230,11 +245,19 @@ class AgentScraper(BaseScraper):
                         if parsed:
                             agents.append(parsed)
                     if agents:
-                        return agents
+                        return {
+                            'results': agents,
+                            'total_results': total_results,
+                            'current_page': current_page
+                        }
             except (KeyError, TypeError, AttributeError):
                 continue
         
-        return agents
+        return {
+            'results': agents,
+            'total_results': total_results,
+            'current_page': current_page
+        }
     
     def _parse_agent_from_json(self, agent_data: Dict, location: str) -> Optional[Dict]:
         """Parse a single agent from JSON data."""
