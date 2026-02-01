@@ -24,21 +24,26 @@ logger = logging.getLogger(__name__)
 class AgentScraper(BaseScraper):
     """Scraper for Zillow agent data."""
     
-    def get_agents_by_location(self, location: str) -> List[Dict]:
+    def get_agents_by_location(self, location: str, page: int = 1) -> Dict[str, Any]:
         """
         Get agents by location.
         
         Args:
             location: Location slug (e.g., "los-angeles")
+            page: Page number
             
         Returns:
-            List of agent dictionaries
+            Dict with 'results' (list), 'total_results', and 'current_page' (inside 'results' key? No, top level)
+            Wait, I'll return Dict but caller expects specific structure. 
+            The view expects me to return Dict.
         """
         url = f"{self.BASE_URL}/professionals/real-estate-agent-reviews/{location}/"
-        
+        if page > 1:
+            url = f"{url}?page={page}"
+            
         try:
             soup = self.get_soup(url)
-            agents = []
+            agents_result = {'results': [], 'total_results': 0, 'current_page': page}
             
             # Debug: Log page title to verify we got the right page
             title = soup.find('title')
@@ -56,13 +61,21 @@ class AgentScraper(BaseScraper):
                 if script_text.strip().startswith('{'):
                     try:
                         data = json.loads(script_text)
-                        agents = self._extract_agents_from_json(data, location)
-                        if agents:
-                            logger.info(f"Found {len(agents)} agents from direct JSON parse")
-                            return {
-                                'source_url': url,
-                                'results': agents
-                            }
+                        extracted = self._extract_agents_from_json(data, location)
+                        
+                        # Handle if extracted is list (old) or dict (new)
+                        # We will update _extract_agents_from_json next
+                        # For now assume it might return list, we wrap it
+                        if isinstance(extracted, list):
+                             if extracted:
+                                agents_result['results'] = extracted
+                                agents_result['total_results'] = len(extracted)
+                                return agents_result
+                        elif isinstance(extracted, dict):
+                             if extracted.get('results'):
+                                 if extracted.get('total_results', 0) == 0:
+                                     extracted['total_results'] = len(extracted['results'])
+                                 return extracted
                     except json.JSONDecodeError:
                         pass
                 
@@ -70,13 +83,18 @@ class AgentScraper(BaseScraper):
                 if '"pageProps"' in script_text or '"searchResults"' in script_text:
                     try:
                         data = json.loads(script_text)
-                        agents = self._extract_agents_from_json(data, location)
-                        if agents:
-                            logger.info(f"Found {len(agents)} agents from pageProps")
-                            return {
-                                'source_url': url,
-                                'results': agents
-                            }
+                        extracted = self._extract_agents_from_json(data, location)
+                        
+                        if isinstance(extracted, list):
+                             if extracted:
+                                agents_result['results'] = extracted
+                                agents_result['total_results'] = len(extracted)
+                                return agents_result
+                        elif isinstance(extracted, dict):
+                             if extracted.get('results'):
+                                 if extracted.get('total_results', 0) == 0:
+                                     extracted['total_results'] = len(extracted['results'])
+                                 return extracted
                     except json.JSONDecodeError:
                         pass
             
@@ -132,9 +150,11 @@ class AgentScraper(BaseScraper):
             logger.error(f"Failed to get agents by location: {e}")
             raise ScraperException(f"Failed to get agents for {location}: {e}")
     
-    def _extract_agents_from_json(self, data: Dict, location: str) -> List[Dict]:
+    def _extract_agents_from_json(self, data: Dict, location: str) -> Dict[str, Any]:
         """Extract agents from various JSON structures."""
         agents = []
+        total_results = 0
+        current_page = 1
         
         # Try to navigate to searchResults first
         search_results = None
@@ -143,6 +163,11 @@ class AgentScraper(BaseScraper):
             page_props = data.get('props', {}).get('pageProps', {})
             display_data = page_props.get('displayData', {})
             agent_display = display_data.get('agentDirectoryFinderDisplay', {})
+            
+            # Extract metadata
+            total_results = agent_display.get('totalResultCount', 0)
+            current_page = agent_display.get('currentPage', 1)
+            
             search_results = agent_display.get('searchResults', {})
             
             if search_results:
@@ -576,16 +601,17 @@ class AgentScraper(BaseScraper):
             logger.error(f"Failed to get agent info: {e}")
             raise ScraperException(f"Failed to get agent info: {e}")
     
-    def get_agent_reviews(self, agentname: str = None, url: str = None) -> List[Dict]:
+    def get_agent_reviews(self, agentname: str = None, url: str = None, page: int = 1) -> Dict[str, Any]:
         """
         Get agent reviews.
         
         Args:
             agentname: Agent screen name
             url: Direct profile URL
+            page: Page number
             
         Returns:
-            List of review dictionaries
+            Dict with 'results', 'total_reviews', and 'current_page'
         """
         if url:
             profile_url = url.rstrip('/') + '/reviews/'
@@ -593,6 +619,9 @@ class AgentScraper(BaseScraper):
             profile_url = f"{self.BASE_URL}/profile/{agentname}/reviews/"
         else:
             raise ValueError("Either agentname or url must be provided")
+            
+        if page > 1:
+            profile_url = f"{profile_url}?page={page}"
         
         try:
             soup = self.get_soup(profile_url)
@@ -659,7 +688,8 @@ class AgentScraper(BaseScraper):
             return {
                 'source_url': profile_url,
                 'total_reviews': total_reviews,
-                'results': reviews
+                'results': reviews,
+                'current_page': page
             }
             
         except NotFoundException:
@@ -673,7 +703,8 @@ class AgentScraper(BaseScraper):
         agentname: str = None,
         url: str = None,
         property_type: str = 'for-sale',
-    ) -> List[Dict]:
+        page: int = 1,
+    ) -> Dict[str, Any]:
         """
         Get agent's properties.
         
@@ -681,9 +712,10 @@ class AgentScraper(BaseScraper):
             agentname: Agent screen name
             url: Direct profile URL
             property_type: 'for-sale', 'for-rent', or 'sold'
+            page: Page number
             
         Returns:
-            List of property dictionaries
+            Dict with 'results' and metadata
         """
         type_paths = {
             'for-sale': '/listings/for-sale/',
@@ -699,6 +731,9 @@ class AgentScraper(BaseScraper):
             profile_url = f"{self.BASE_URL}/profile/{agentname}{path}"
         else:
             raise ValueError("Either agentname or url must be provided")
+            
+        if page > 1:
+            profile_url = f"{profile_url}?page={page}"
         
         try:
             try:
@@ -713,6 +748,7 @@ class AgentScraper(BaseScraper):
                 soup = self.get_soup(profile_url)
 
             properties = []
+            total_properties = 0
             
             # Try script data
             script_data = extract_json_from_script(soup)
@@ -733,6 +769,7 @@ class AgentScraper(BaseScraper):
                         # Handle if found is a dict with 'listings' or 'past_sales' (common in Next.js)
                         if isinstance(found, dict):
                             listings = found.get('listings') or found.get('past_sales') or []
+                            total_properties = found.get('totalCount') or found.get('totalResultCount') or found.get('count') or 0
                         elif isinstance(found, list):
                             listings = found
                         
@@ -767,9 +804,14 @@ class AgentScraper(BaseScraper):
             if not properties:
                 raise NotFoundException(f"No {property_type} properties found for agent")
             
+            if total_properties == 0 and properties:
+                total_properties = len(properties)
+                
             return {
                 'source_url': profile_url,
-                'results': properties
+                'results': properties,
+                'total_results': total_properties,
+                'current_page': page
             }
             
         except NotFoundException:

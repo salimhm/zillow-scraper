@@ -51,6 +51,18 @@ class ReviewSerializer(serializers.Serializer):
     transaction_type = serializers.CharField(required=False, allow_blank=True)
 
 
+class PaginationMetadataSerializer(serializers.Serializer):
+    """Serializer for pagination metadata."""
+    
+    total_results = serializers.IntegerField()
+    total_pages = serializers.IntegerField()
+    current_page = serializers.IntegerField()
+    per_page = serializers.IntegerField()
+    has_next = serializers.BooleanField()
+    has_previous = serializers.BooleanField()
+
+
+
 class AutocompleteSuggestionSerializer(serializers.Serializer):
     """Serializer for autocomplete suggestions."""
     

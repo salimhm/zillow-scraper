@@ -3,10 +3,10 @@ API Views for the Zillow scraper.
 """
 
 import logging
-from rest_framework import status
+from rest_framework import status, serializers
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+from drf_spectacular.utils import extend_schema, OpenApiParameter, inline_serializer
 from drf_spectacular.types import OpenApiTypes
 
 from .serializers import (
@@ -16,12 +16,45 @@ from .serializers import (
     AutocompleteSuggestionSerializer,
     ApartmentDetailsSerializer,
     ErrorSerializer,
+    PaginationMetadataSerializer,
 )
 from scrapers.agent_scraper import agent_scraper
 from scrapers.property_scraper import property_scraper
 from scrapers.base import NotFoundException, ScraperException
 
 logger = logging.getLogger(__name__)
+
+# Zillow typically returns 40 results per page
+DEFAULT_PER_PAGE = 40
+
+
+def get_paginated_response_schema(resource_serializer_class, name):
+    """Helper to generate paginated response schema."""
+    return inline_serializer(
+        name=name,
+        fields={
+            'count': serializers.IntegerField(),
+            'results': resource_serializer_class(many=True),
+            'pagination': PaginationMetadataSerializer(),
+        }
+    )
+
+
+def build_paginated_response(results, total_results, current_page, per_page=DEFAULT_PER_PAGE):
+    """Build a standardized paginated response wrapper."""
+    total_pages = max(1, (total_results + per_page - 1) // per_page)
+    return {
+        'count': len(results),
+        'results': results,
+        'pagination': {
+            'total_results': total_results,
+            'total_pages': total_pages,
+            'current_page': current_page,
+            'per_page': per_page,
+            'has_next': current_page < total_pages,
+            'has_previous': current_page > 1,
+        }
+    }
 
 
 # ============================================================================
@@ -39,9 +72,10 @@ logger = logging.getLogger(__name__)
             description='Location slug (e.g., los-angeles, new-york-ny, miami-fl)',
             required=False,
         ),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: AgentSerializer(many=True),
+        200: get_paginated_response_schema(AgentSerializer, 'PaginatedAgentResponse'),
         404: ErrorSerializer,
     },
     tags=['Agents']
@@ -50,14 +84,16 @@ logger = logging.getLogger(__name__)
 def agent_by_location(request):
     """Get agents by location."""
     location = request.query_params.get('location', 'los-angeles')
+    page = int(request.query_params.get('page', 1))
     
-    result = agent_scraper.get_agents_by_location(location)
+    result = agent_scraper.get_agents_by_location(location, page=page)
+    
     serializer = AgentSerializer(result['results'], many=True)
-    return Response({
-        'source_url': result['source_url'],
-        'count': len(result['results']),
-        'results': serializer.data
-    })
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -123,9 +159,10 @@ def agent_info(request):
             description='Agent profile URL',
             required=False,
         ),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: ReviewSerializer(many=True),
+        200: get_paginated_response_schema(ReviewSerializer, 'PaginatedReviewResponse'),
         404: ErrorSerializer,
     },
     tags=['Agents']
@@ -135,6 +172,7 @@ def agent_reviews(request):
     """Get agent reviews."""
     agentname = request.query_params.get('agentname')
     url = request.query_params.get('url')
+    page = int(request.query_params.get('page', 1))
     
     if not agentname and not url:
         return Response(
@@ -142,14 +180,14 @@ def agent_reviews(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    result = agent_scraper.get_agent_reviews(agentname=agentname, url=url)
+    result = agent_scraper.get_agent_reviews(agentname=agentname, url=url, page=page)
     serializer = ReviewSerializer(result['results'], many=True)
-    return Response({
-        'source_url': result['source_url'],
-        'total_reviews': result.get('total_reviews', 0),
-        'count': len(result['results']),
-        'results': serializer.data
-    })
+    
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_reviews', 0),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -170,9 +208,10 @@ def agent_reviews(request):
             description='Agent profile URL',
             required=False,
         ),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Agents']
@@ -182,6 +221,7 @@ def agent_for_sale_properties(request):
     """Get agent's for-sale properties."""
     agentname = request.query_params.get('agentname')
     url = request.query_params.get('url')
+    page = int(request.query_params.get('page', 1))
     
     if not agentname and not url:
         return Response(
@@ -190,14 +230,14 @@ def agent_for_sale_properties(request):
         )
     
     result = agent_scraper.get_agent_properties(
-        agentname=agentname, url=url, property_type='for-sale'
+        agentname=agentname, url=url, property_type='for-sale', page=page
     )
     serializer = PropertySerializer(result['results'], many=True)
-    return Response({
-        'source_url': result['source_url'],
-        'count': len(result['results']),
-        'results': serializer.data
-    })
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -218,9 +258,10 @@ def agent_for_sale_properties(request):
             description='Agent profile URL',
             required=False,
         ),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Agents']
@@ -230,6 +271,7 @@ def agent_for_rent_properties(request):
     """Get agent's rental properties."""
     agentname = request.query_params.get('agentname')
     url = request.query_params.get('url')
+    page = int(request.query_params.get('page', 1))
     
     if not agentname and not url:
         return Response(
@@ -238,14 +280,14 @@ def agent_for_rent_properties(request):
         )
     
     result = agent_scraper.get_agent_properties(
-        agentname=agentname, url=url, property_type='for-rent'
+        agentname=agentname, url=url, property_type='for-rent', page=page
     )
     serializer = PropertySerializer(result['results'], many=True)
-    return Response({
-        'source_url': result['source_url'],
-        'count': len(result['results']),
-        'results': serializer.data
-    })
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -266,9 +308,10 @@ def agent_for_rent_properties(request):
             description='Agent profile URL',
             required=False,
         ),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Agents']
@@ -278,6 +321,7 @@ def agent_sold_properties(request):
     """Get agent's sold properties."""
     agentname = request.query_params.get('agentname')
     url = request.query_params.get('url')
+    page = int(request.query_params.get('page', 1))
     
     if not agentname and not url:
         return Response(
@@ -286,14 +330,14 @@ def agent_sold_properties(request):
         )
     
     result = agent_scraper.get_agent_properties(
-        agentname=agentname, url=url, property_type='sold'
+        agentname=agentname, url=url, property_type='sold', page=page
     )
     serializer = PropertySerializer(result['results'], many=True)
-    return Response({
-        'source_url': result['source_url'],
-        'count': len(result['results']),
-        'results': serializer.data
-    })
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 # ============================================================================
@@ -353,7 +397,7 @@ def _get_property_filters(request):
         # Add more as needed
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -366,15 +410,21 @@ def by_location(request):
     page = int(request.query_params.get('page', 1))
     
     filters = _get_property_filters(request)
+    filters.pop('page', None)  # Remove page from filters - we pass it explicitly
     
-    properties = property_scraper.search_by_location(
+    result = property_scraper.search_by_location(
         location=location,
         list_type=list_type,
         page=page,
         **filters
     )
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -384,9 +434,10 @@ def by_location(request):
         OpenApiParameter(name='lat', type=OpenApiTypes.NUMBER, description='Latitude', required=True),
         OpenApiParameter(name='lng', type=OpenApiTypes.NUMBER, description='Longitude', required=True),
         OpenApiParameter(name='listType', type=OpenApiTypes.STR, description='Listing type'),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -413,13 +464,20 @@ def by_coordinates(request):
         )
     
     list_type = request.query_params.get('listType', 'for-sale')
+    page = int(request.query_params.get('page', 1))
     filters = _get_property_filters(request)
+    filters.pop('page', None)  # Remove page from filters
     
-    properties = property_scraper.search_by_coordinates(
-        lat=lat, lng=lng, list_type=list_type, **filters
+    result = property_scraper.search_by_coordinates(
+        lat=lat, lng=lng, list_type=list_type, page=page, **filters
     )
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -434,7 +492,7 @@ def by_coordinates(request):
         OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -467,13 +525,19 @@ def by_map_bounds(request):
     list_type = request.query_params.get('listType', 'for-sale')
     page = int(request.query_params.get('page', 1))
     filters = _get_property_filters(request)
+    filters.pop('page', None)  # Remove page from filters
     
-    properties = property_scraper.search_by_map_bounds(
+    result = property_scraper.search_by_map_bounds(
         north=north, south=south, east=east, west=west,
         list_type=list_type, page=page, **filters
     )
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -481,9 +545,10 @@ def by_map_bounds(request):
     description="Search for properties by MLS listing ID.",
     parameters=[
         OpenApiParameter(name='mlsid', type=OpenApiTypes.STR, description='MLS listing ID', required=True),
+        OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -499,11 +564,18 @@ def by_mls_id(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
+    page = int(request.query_params.get('page', 1))
     filters = _get_property_filters(request)
+    filters.pop('page', None)  # Remove page from filters
     
-    properties = property_scraper.search_by_mls_id(mls_id=mls_id, **filters)
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    result = property_scraper.search_by_mls_id(mls_id=mls_id, page=page, **filters)
+    
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -520,7 +592,7 @@ def by_mls_id(request):
         OpenApiParameter(name='page', type=OpenApiTypes.INT, description='Page number'),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -539,12 +611,18 @@ def by_polygon(request):
     list_type = request.query_params.get('listType', 'for-sale')
     page = int(request.query_params.get('page', 1))
     filters = _get_property_filters(request)
+    filters.pop('page', None)  # Remove page from filters
     
-    properties = property_scraper.search_by_polygon(
+    result = property_scraper.search_by_polygon(
         polygon=polygon, list_type=list_type, page=page, **filters
     )
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', page)
+    ))
 
 
 @extend_schema(
@@ -554,7 +632,7 @@ def by_polygon(request):
         OpenApiParameter(name='url', type=OpenApiTypes.STR, description='Zillow search URL', required=True),
     ],
     responses={
-        200: PropertySerializer(many=True),
+        200: get_paginated_response_schema(PropertySerializer, 'PaginatedPropertyResponse'),
         404: ErrorSerializer,
     },
     tags=['Properties']
@@ -570,15 +648,20 @@ def by_url(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    properties = property_scraper.search_by_url(url=url)
+    result = property_scraper.search_by_url(url=url)
     
-    # Return single object for property detail URLs, array for search URLs
-    if '/homedetails/' in url and properties:
-        serializer = PropertySerializer(properties[0])
+    # Return single object for property detail URLs
+    if '/homedetails/' in url and result.get('results'):
+        serializer = PropertySerializer(result['results'][0])
         return Response(serializer.data)
     
-    serializer = PropertySerializer(properties, many=True)
-    return Response(serializer.data)
+    # Return paginated response for search URLs
+    serializer = PropertySerializer(result['results'], many=True)
+    return Response(build_paginated_response(
+        results=serializer.data,
+        total_results=result.get('total_results', len(result['results'])),
+        current_page=result.get('current_page', 1)
+    ))
 
 
 # ============================================================================

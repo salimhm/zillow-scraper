@@ -131,10 +131,47 @@ class PropertyScraper(BaseScraper):
         
         return filter_state
     
-    def _parse_search_results(self, soup) -> List[Dict]:
-        """Parse property search results from page."""
-        properties = []
+    def _parse_search_results(self, soup) -> Dict[str, Any]:
+        """Parse property search results from page.
         
+        Returns:
+            Dict with 'results' (list of properties) and 'total_results' (int)
+        """
+        properties = []
+        total_results = 0
+        
+        # Helper to find total count recursively
+        def find_total(obj):
+            if isinstance(obj, dict):
+                # Check common keys
+                for key in ['totalResultCount', 'resultCount', 'totalCount']:
+                    if key in obj and isinstance(obj[key], (int, str)):
+                        try:
+                            val = int(obj[key])
+                            if val > 100:  # Sanity check - unlikely to be < 100 for broad searches
+                                return val
+                        except:
+                            pass
+                
+                # Check if this object IS the search results container
+                if 'listResults' in obj:
+                    for key in ['totalResultCount', 'resultCount', 'totalCount']:
+                        if key in obj:
+                            try:
+                                return int(obj[key])
+                            except:
+                                pass
+
+                # Recurse
+                for v in obj.values():
+                    res = find_total(v)
+                    if res: return res
+            elif isinstance(obj, list):
+                for item in obj:
+                    res = find_total(item)
+                    if res: return res
+            return 0
+
         # Try to find JSON data in script tags
         for script in soup.find_all('script'):
             script_text = script.string or ''
@@ -148,30 +185,49 @@ class PropertyScraper(BaseScraper):
                 try:
                     data = json.loads(script_text)
                     
-                    # Try various paths to find property results
-                    paths_to_try = [
-                        # Next.js pageProps structure
-                        lambda d: d.get('props', {}).get('pageProps', {}).get('searchPageState', {}).get('cat1', {}).get('searchResults', {}).get('listResults', []),
-                        lambda d: d.get('props', {}).get('pageProps', {}).get('searchResults', {}).get('listResults', []),
-                        # Direct paths
-                        lambda d: d.get('searchResults', {}).get('listResults', []),
-                        lambda d: d.get('cat1', {}).get('searchResults', {}).get('listResults', []),
-                        lambda d: d.get('searchPageState', {}).get('cat1', {}).get('searchResults', {}).get('listResults', []),
-                        # List at root
-                        lambda d: d.get('listResults', []),
+                    # 1. Try finding total count recursively anywhere in the JSON
+                    found_total = find_total(data)
+                    if found_total > 0:
+                        total_results = found_total
+                    
+                    # 2. Parse property list (keep existing robust paths)
+                    search_results_paths = [
+                        lambda d: d.get('props', {}).get('pageProps', {}).get('searchPageState', {}).get('cat1', {}).get('searchResults', {}),
+                        lambda d: d.get('props', {}).get('pageProps', {}).get('searchResults', {}),
+                        lambda d: d.get('searchResults', {}),
+                        lambda d: d.get('cat1', {}).get('searchResults', {}),
+                        lambda d: d.get('searchPageState', {}).get('cat1', {}).get('searchResults', {}),
                     ]
                     
-                    for path_func in paths_to_try:
+                    for path_func in search_results_paths:
                         try:
-                            results = path_func(data)
-                            if results and isinstance(results, list):
-                                for result in results:
-                                    parsed = parse_property_card(result)
-                                    if parsed and (parsed.get('address') or parsed.get('zpid')):
-                                        properties.append(parsed)
-                                if properties:
-                                    logger.info(f"Found {len(properties)} properties from JSON")
-                                    return properties
+                            search_results = path_func(data)
+                            if search_results and isinstance(search_results, dict):
+                                results = search_results.get('listResults', [])
+                                if results and isinstance(results, list):
+                                    
+                                    # Extract current page
+                                    current_page = (
+                                        search_results.get('pagination', {}).get('currentPage') or
+                                        search_results.get('currentPage') or
+                                        1
+                                    )
+                                    
+                                    for result in results:
+                                        parsed = parse_property_card(result)
+                                        if parsed and (parsed.get('address') or parsed.get('zpid')):
+                                            properties.append(parsed)
+                                    if properties:
+                                        # Use found total, or count of properties if still 0
+                                        if total_results == 0:
+                                            total_results = len(properties)
+                                            
+                                        logger.info(f"Found {len(properties)} properties from JSON (total: {total_results}, page: {current_page})")
+                                        return {
+                                            'results': properties,
+                                            'total_results': total_results,
+                                            'current_page': current_page
+                                        }
                         except (KeyError, TypeError, AttributeError):
                             continue
                             
@@ -256,7 +312,9 @@ class PropertyScraper(BaseScraper):
                     if prop.get('address') or prop.get('zpid'):
                         properties.append(prop)
         
-        return properties
+        # For fallback paths, we don't have total_results from JSON
+        # Return count of found properties as total (best effort)
+        return {'results': properties, 'total_results': len(properties)}
     
     def search_by_location(
         self,
@@ -264,7 +322,7 @@ class PropertyScraper(BaseScraper):
         list_type: str = 'for-sale',
         page: int = 1,
         **filters
-    ) -> List[Dict]:
+    ) -> Dict[str, Any]:
         """
         Search properties by location.
         
@@ -275,19 +333,21 @@ class PropertyScraper(BaseScraper):
             **filters: Additional search filters
             
         Returns:
-            List of property dictionaries
+            Dict with 'results', 'total_results', and 'current_page'
         """
         # Build URL
         url = build_search_url(location, list_type, page)
         
         try:
             soup = self.get_soup(url)
-            properties = self._parse_search_results(soup)
+            parsed = self._parse_search_results(soup)
             
-            if not properties:
+            if not parsed.get('results'):
                 raise NotFoundException(f"No properties found for location: {location}")
             
-            return properties
+            # Add current page to the response
+            parsed['current_page'] = page
+            return parsed
             
         except NotFoundException:
             raise
@@ -300,8 +360,9 @@ class PropertyScraper(BaseScraper):
         lat: float,
         lng: float,
         list_type: str = 'for-sale',
+        page: int = 1,
         **filters
-    ) -> List[Dict]:
+    ) -> Dict[str, Any]:
         """
         Search properties by coordinates.
         
@@ -309,10 +370,11 @@ class PropertyScraper(BaseScraper):
             lat: Latitude
             lng: Longitude
             list_type: 'for-sale', 'for-rent', or 'sold'
+            page: Page number
             **filters: Additional search filters
             
         Returns:
-            List of property dictionaries
+            Dict with 'results', 'total_results', and 'current_page'
         """
         # Create a small bounding box around coordinates
         delta = 0.05  # Approximately 3.5 miles
@@ -323,6 +385,7 @@ class PropertyScraper(BaseScraper):
             east=lng + delta,
             west=lng - delta,
             list_type=list_type,
+            page=page,
             **filters
         )
     
@@ -335,7 +398,7 @@ class PropertyScraper(BaseScraper):
         list_type: str = 'for-sale',
         page: int = 1,
         **filters
-    ) -> List[Dict]:
+    ) -> Dict[str, Any]:
         """
         Search properties by map bounds.
         
@@ -349,7 +412,7 @@ class PropertyScraper(BaseScraper):
             **filters: Additional search filters
             
         Returns:
-            List of property dictionaries
+            Dict with 'results', 'total_results', and 'current_page'
         """
         # Build search query state
         map_bounds = {
@@ -380,12 +443,14 @@ class PropertyScraper(BaseScraper):
         
         try:
             soup = self.get_soup(url)
-            properties = self._parse_search_results(soup)
+            parsed = self._parse_search_results(soup)
             
-            if not properties:
+            if not parsed.get('results'):
                 raise NotFoundException("No properties found in specified bounds")
             
-            return properties
+            # Add current page
+            parsed['current_page'] = page
+            return parsed
             
         except NotFoundException:
             raise
@@ -393,26 +458,39 @@ class PropertyScraper(BaseScraper):
             logger.error(f"Failed to search by map bounds: {e}")
             raise ScraperException(f"Failed to search properties: {e}")
     
-    def search_by_mls_id(self, mls_id: str, **filters) -> List[Dict]:
+    def search_by_mls_id(self, mls_id: str, page: int = 1, **filters) -> Dict[str, Any]:
         """
         Search properties by MLS ID.
         
         Args:
             mls_id: MLS listing ID
+            page: Page number
             **filters: Additional search filters
             
         Returns:
-            List of property dictionaries
+            Dict with 'results' (list), 'total_results', and 'current_page'
         """
         try:
             # Search for the MLS ID
             search_url = f"{self.BASE_URL}/homes/{mls_id}/"
+            
+            # Add pagination if needed
+            if page > 1:
+                if search_url.endswith('/'):
+                    search_url = f"{search_url}{page}_p/"
+                else:
+                    search_url = f"{search_url}/{page}_p/"
+            
             soup = self.get_soup(search_url)
             properties = self._parse_search_results(soup)
             
-            if not properties:
+            if not properties.get('results'):
                 raise NotFoundException(f"No properties found for MLS ID: {mls_id}")
             
+            # Ensure current page is set
+            if 'current_page' not in properties:
+                properties['current_page'] = page
+                
             return properties
             
         except NotFoundException:
@@ -427,7 +505,7 @@ class PropertyScraper(BaseScraper):
         list_type: str = 'for-sale',
         page: int = 1,
         **filters
-    ) -> List[Dict]:
+    ) -> Dict[str, Any]:
         """
         Search properties by polygon coordinates.
         
@@ -438,7 +516,7 @@ class PropertyScraper(BaseScraper):
             **filters: Additional search filters
             
         Returns:
-            List of property dictionaries
+            Dict with 'results', 'total_results', and 'current_page'
         """
         # Parse polygon coordinates
         coords = []
@@ -467,7 +545,7 @@ class PropertyScraper(BaseScraper):
             **filters
         )
     
-    def search_by_url(self, url: str) -> List[Dict]:
+    def search_by_url(self, url: str) -> Dict[str, Any]:
         """
         Parse a Zillow URL and return results.
         Handles both search result pages and individual property detail pages.
@@ -476,7 +554,7 @@ class PropertyScraper(BaseScraper):
             url: Full Zillow URL (search results or property detail)
             
         Returns:
-            List of property dictionaries
+            Dict with 'results' (list), 'total_results', and 'current_page'
         """
         try:
             soup = self.get_soup(url)
@@ -494,16 +572,32 @@ class PropertyScraper(BaseScraper):
             if '/homedetails/' in url:
                 property_data = self._parse_property_details(soup, url)
                 if property_data:
-                    return [property_data]
+                    return {
+                        'results': [property_data],
+                        'total_results': 1,
+                        'current_page': 1
+                    }
                 raise NotFoundException("No property details found at URL")
             
             # Otherwise, treat as search results page
-            properties = self._parse_search_results(soup)
+            # Note: We don't control the page number here as it comes from the URL
+            parsed = self._parse_search_results(soup)
             
-            if not properties:
+            if not parsed.get('results'):
                 raise NotFoundException("No properties found at URL")
             
-            return properties
+            # Try to extract page number from URL if not available or if it's 1 (default)
+            # URL patterns: /2_p/ or directory/2_p/
+            if parsed.get('current_page', 1) == 1:
+                page_match = re.search(r'/(\d+)_p/', url)
+                if page_match:
+                    parsed['current_page'] = int(page_match.group(1))
+            
+            # Ensure proper defaults
+            if 'current_page' not in parsed:
+                parsed['current_page'] = 1
+                
+            return parsed
             
         except NotFoundException:
             raise
