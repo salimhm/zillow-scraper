@@ -39,11 +39,8 @@ class SessionPool:
     """
     Manages a pool of warm curl_cffi Sessions.
     
-    Key insight: curl_cffi's first request takes ~10s due to TLS handshake +
-    PerimeterX challenge cookie generation. Subsequent requests on the same
-    session take ~1.3s because TLS tickets and cookies are cached.
-    
-    This pool pre-warms sessions and reuses them across Django requests.
+    Sessions are reused across Django requests so TLS connections and cookies
+    can be reused without adding a second upstream request to every call.
     """
     
     _instance = None
@@ -68,35 +65,12 @@ class SessionPool:
         logger.info("SessionPool initialized")
     
     def _create_session(self, proxies) -> requests.Session:
-        """Create and pre-warm a new curl_cffi session."""
-
-        
+        """Create a session without doing an extra network request."""
         session = requests.Session()
-        
-        # Pre-warm: hit Zillow homepage to establish TLS + get challenge cookies
-        try:
-            proxy_log = proxies['http'][:30] + '...' if proxies else 'none'
-            logger.info(f"Pre-warming session against Zillow with proxy {proxy_log}")
-            t0 = time.time()
-            resp = session.get(
-                "https://www.zillow.com/",
-                impersonate="chrome",
-                proxies=proxies,
-                timeout=30,
-            )
-            elapsed = time.time() - t0
-            logger.info(
-                f"Session pre-warmed in {elapsed:.2f}s "
-                f"(HTTP {resp.status_code}, {len(resp.content)} bytes)"
-            )
-        except Exception as e:
-            logger.warning(f"Session pre-warm failed: {e} (will use cold session)")
-        
         return session
     
-    def get_session(self) -> requests.Session:
+    def get_session(self, proxies=None) -> requests.Session:
         """Get a warm session, creating/refreshing if needed."""
-        proxies = proxy_manager.get_proxy()
         proxy_key = proxies['http'] if proxies else 'default'
         
         with self._session_lock:
@@ -125,9 +99,8 @@ class SessionPool:
             session_data['request_count'] += 1
             return session_data['session']
     
-    def invalidate(self):
+    def invalidate(self, proxies=None):
         """Force-refresh the session (e.g., after repeated blocks)."""
-        proxies = proxy_manager.get_proxy()
         proxy_key = proxies['http'] if proxies else 'default'
         
         with self._session_lock:
@@ -160,8 +133,11 @@ class BaseScraper:
         scraper_settings = getattr(settings, 'SCRAPER_SETTINGS', {})
         self.delay_min = scraper_settings.get('REQUEST_DELAY_MIN', 1.0)
         self.delay_max = scraper_settings.get('REQUEST_DELAY_MAX', 3.0)
-        self.timeout = scraper_settings.get('REQUEST_TIMEOUT', 30)
-        self.max_retries = scraper_settings.get('MAX_RETRIES', 3)
+        # Keep the synchronous API within the advertised 3-4 second budget.
+        # A retry has another full network timeout, so retries are disabled for
+        # the synchronous public endpoints. Failed upstream calls fail fast.
+        self.timeout = min(float(scraper_settings.get('REQUEST_TIMEOUT', 3.5)), 3.5)
+        self.max_retries = 0
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers with a random user agent."""
@@ -193,6 +169,7 @@ class BaseScraper:
         json_data: Optional[Dict] = None,
         use_proxy: bool = True,
         retry_count: int = 0,
+        deadline: Optional[float] = None,
     ) -> requests.Response:
         """
         Make an HTTP request using the warm session pool.
@@ -212,11 +189,18 @@ class BaseScraper:
         Raises:
             ScraperException: If request fails after all retries
         """
-        if retry_count > 0:
+        if deadline is None:
+            deadline = time.monotonic() + self.timeout
+
+        if retry_count > 0 and self.delay_max > 0:
             self._delay()
-        
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ScraperException(f"Request deadline exceeded for {url}")
+
         proxies = proxy_manager.get_proxy() if use_proxy else None
-        session = session_pool.get_session()
+        session = session_pool.get_session(proxies=proxies)
         
         try:
             response = session.request(
@@ -226,7 +210,11 @@ class BaseScraper:
                 data=data,
                 json=json_data,
                 proxies=proxies,
-                timeout=self.timeout,
+                # Give a configured proxy a short chance, then use the
+                # remaining request budget for a direct request if it is
+                # unavailable. This prevents a dead proxy from taking down
+                # every endpoint while keeping the 3-4 second SLA.
+                timeout=min(remaining, 1.5) if use_proxy else remaining,
                 impersonate="chrome"
             )
             
@@ -253,9 +241,23 @@ class BaseScraper:
             if proxies:
                 proxy_manager.mark_proxy_failed(proxies.get('http', ''))
             
-            # On repeated blocks, invalidate the session to force re-warm
-            if retry_count >= 2:
-                session_pool.invalidate()
+            # Drop the failed session before trying another route.
+            session_pool.invalidate(proxies=proxies)
+
+            # A stale/dead proxy is an infrastructure failure, not a reason
+            # to return 503 when direct Zillow access is available.
+            if use_proxy:
+                logger.warning("Proxy request failed; trying direct Zillow access")
+                return self._make_request(
+                    url=url,
+                    method=method,
+                    params=params,
+                    data=data,
+                    json_data=json_data,
+                    use_proxy=False,
+                    retry_count=retry_count,
+                    deadline=deadline,
+                )
             
             if retry_count < self.max_retries:
                 logger.warning(
@@ -269,6 +271,7 @@ class BaseScraper:
                     json_data=json_data,
                     use_proxy=use_proxy,
                     retry_count=retry_count + 1,
+                    deadline=deadline,
                 )
             
             logger.error(f"Request failed after {self.max_retries} retries: {e}")
