@@ -167,9 +167,8 @@ SCRAPER_SETTINGS = {
     'USER_AGENTS': config('USER_AGENTS', default='', cast=Csv()),
     'REQUEST_DELAY_MIN': config('REQUEST_DELAY_MIN', default=0, cast=float),
     'REQUEST_DELAY_MAX': config('REQUEST_DELAY_MAX', default=0, cast=float),
-    # Public endpoints are synchronous; keep upstream work bounded.
-    'REQUEST_TIMEOUT': config('REQUEST_TIMEOUT', default=3.5, cast=float),
-    'MAX_RETRIES': config('MAX_RETRIES', default=0, cast=int),
+    'REQUEST_TIMEOUT': config('REQUEST_TIMEOUT', default=15, cast=float),
+    'MAX_RETRIES': config('MAX_RETRIES', default=2, cast=int),
 }
 
 # Logging

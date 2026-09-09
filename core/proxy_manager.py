@@ -6,6 +6,7 @@ the provider handles IP rotation automatically on each request.
 """
 
 import logging
+import random
 from typing import Optional, Dict
 from django.conf import settings
 from core.middleware import get_current_request
@@ -24,18 +25,18 @@ class ProxyManager:
     def __init__(self):
         pass
         
-    def _load_proxy(self, proxy_type: str = 'PROXIES') -> Optional[str]:
+    def _load_proxy(self, proxy_type: str = 'PROXIES', excluded=None) -> Optional[str]:
         """Load proxy from settings."""
         proxies = settings.SCRAPER_SETTINGS.get(proxy_type, [])
         if isinstance(proxies, str):
             proxies = [p.strip() for p in proxies.split(',') if p.strip()]
         
-        if proxies:
-            # Use the first proxy URL (provider handles rotation)
-            return proxies[0] if proxies else None
+        available = [proxy for proxy in proxies if proxy not in set(excluded or [])]
+        if available:
+            return random.choice(available)
         return None
     
-    def get_proxy(self) -> Optional[Dict[str, str]]:
+    def get_proxy(self, excluded=None) -> Optional[Dict[str, str]]:
         """
         Get the configured proxy dynamically based on the current request host.
         
@@ -56,7 +57,7 @@ class ProxyManager:
                 'zillow-com-live-data-scraper-api.p.rapidapi.com' in forwarded_host):
                 proxy_type = 'PROXIES_LIVE_DATA'
                 
-        proxy_url = self._load_proxy(proxy_type)
+        proxy_url = self._load_proxy(proxy_type, excluded=excluded)
         
         if proxy_type == 'PROXIES_LIVE_DATA' and not proxy_url:
             raise ValueError("PROXIES_LIVE_DATA must be defined when using the zillow-com-live-data-scraper-api host.")

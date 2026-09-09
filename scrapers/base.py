@@ -136,8 +136,8 @@ class BaseScraper:
         # Keep the synchronous API within the advertised 3-4 second budget.
         # A retry has another full network timeout, so retries are disabled for
         # the synchronous public endpoints. Failed upstream calls fail fast.
-        self.timeout = min(float(scraper_settings.get('REQUEST_TIMEOUT', 3.5)), 3.5)
-        self.max_retries = 0
+        self.timeout = max(float(scraper_settings.get('REQUEST_TIMEOUT', 15)), 1.0)
+        self.max_retries = max(int(scraper_settings.get('MAX_RETRIES', 2)), 0)
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers with a random user agent."""
@@ -167,9 +167,11 @@ class BaseScraper:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
         json_data: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
         use_proxy: bool = True,
         retry_count: int = 0,
         deadline: Optional[float] = None,
+        excluded_proxies=None,
     ) -> requests.Response:
         """
         Make an HTTP request using the warm session pool.
@@ -199,7 +201,16 @@ class BaseScraper:
         if remaining <= 0:
             raise ScraperException(f"Request deadline exceeded for {url}")
 
-        proxies = proxy_manager.get_proxy() if use_proxy else None
+        proxies = (
+            proxy_manager.get_proxy(excluded=excluded_proxies)
+            if use_proxy else None
+        )
+        if use_proxy and proxies is None:
+            return self._make_request(
+                url=url, method=method, params=params, data=data,
+                json_data=json_data, headers=headers, use_proxy=False,
+                retry_count=retry_count, deadline=deadline,
+            )
         session = session_pool.get_session(proxies=proxies)
         
         try:
@@ -209,12 +220,13 @@ class BaseScraper:
                 params=params,
                 data=data,
                 json=json_data,
+                headers={**self._get_headers(), **(headers or {})},
                 proxies=proxies,
                 # Give a configured proxy a short chance, then use the
                 # remaining request budget for a direct request if it is
                 # unavailable. This prevents a dead proxy from taking down
                 # every endpoint while keeping the 3-4 second SLA.
-                timeout=min(remaining, 1.5) if use_proxy else remaining,
+                timeout=min(remaining, 3.0) if use_proxy else remaining,
                 impersonate="chrome"
             )
             
@@ -247,16 +259,24 @@ class BaseScraper:
             # A stale/dead proxy is an infrastructure failure, not a reason
             # to return 503 when direct Zillow access is available.
             if use_proxy:
-                logger.warning("Proxy request failed; trying direct Zillow access")
+                failed_proxies = set(excluded_proxies or [])
+                if proxies:
+                    failed_proxies.add(proxies.get('http', ''))
+                logger.warning(
+                    "Proxy request failed (%s); trying another configured proxy",
+                    e,
+                )
                 return self._make_request(
                     url=url,
                     method=method,
                     params=params,
                     data=data,
                     json_data=json_data,
-                    use_proxy=False,
+                    headers=headers,
+                    use_proxy=True,
                     retry_count=retry_count,
                     deadline=deadline,
+                    excluded_proxies=failed_proxies,
                 )
             
             if retry_count < self.max_retries:
@@ -269,9 +289,11 @@ class BaseScraper:
                     params=params,
                     data=data,
                     json_data=json_data,
+                    headers=headers,
                     use_proxy=use_proxy,
                     retry_count=retry_count + 1,
                     deadline=deadline,
+                    excluded_proxies=excluded_proxies,
                 )
             
             logger.error(f"Request failed after {self.max_retries} retries: {e}")
@@ -281,10 +303,13 @@ class BaseScraper:
         self,
         url: str,
         params: Optional[Dict] = None,
+        headers: Optional[Dict[str, str]] = None,
         use_proxy: bool = True,
     ) -> requests.Response:
         """Make a GET request."""
-        return self._make_request(url, 'GET', params=params, use_proxy=use_proxy)
+        return self._make_request(
+            url, 'GET', params=params, headers=headers, use_proxy=use_proxy
+        )
     
     def post(
         self,

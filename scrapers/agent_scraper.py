@@ -42,12 +42,32 @@ class AgentScraper(BaseScraper):
             Wait, I'll return Dict but caller expects specific structure. 
             The view expects me to return Dict.
         """
-        url = f"{self.BASE_URL}/professionals/real-estate-agent-reviews/{location}/"
-        if page > 1:
-            url = f"{url}?page={page}"
+        url = f"{self.BASE_URL}/professionals/api/v2/search/"
+        params = {
+            'profileType': 2,
+            'page': page,
+            'locationText': location.replace('-', ' ').strip().title(),
+        }
+        api_headers = {
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': f"{self.BASE_URL}/professionals/real-estate-agent-reviews/{location}/",
+            'X-Requested-With': 'XMLHttpRequest',
+        }
             
         try:
-            soup = self.get_soup(url)
+            response = self.get(url, params=params, headers=api_headers)
+            extracted = self._extract_agents_from_json(response.json(), location)
+            if extracted.get('results'):
+                return {
+                    'source_url': response.url,
+                    'results': extracted['results'],
+                    'total_results': extracted.get('total_results') or len(extracted['results']),
+                    'current_page': extracted.get('current_page') or page,
+                }
+
+            # Fallback for an API shape change.
+            html_url = f"{self.BASE_URL}/professionals/real-estate-agent-reviews/{location}/"
+            soup = self.get_soup(html_url)
             agents_result = {'results': [], 'total_results': 0, 'current_page': page}
             
             # Debug: Log page title to verify we got the right page
@@ -234,6 +254,7 @@ class AgentScraper(BaseScraper):
         
         # Try other top-level paths
         paths_to_try = [
+            lambda d: d.get('results', {}).get('professionals', []),
             # Direct access
             lambda d: d.get('searchResults', {}).get('professionals', []),
             lambda d: d.get('professionals', []),
@@ -306,7 +327,12 @@ class AgentScraper(BaseScraper):
             review_info = {}
         
         # Rating: use reviewAverage (number) or reviewAverageText (string like "5.0")
-        rating = review_info.get('reviewAverage') or review_info.get('rating') or agent_data.get('avgRating')
+        rating = (
+            review_info.get('reviewAverage')
+            or review_info.get('rating')
+            or agent_data.get('avgRating')
+            or agent_data.get('reviewStarsRating')
+        )
         if not rating and review_info.get('reviewAverageText'):
             try:
                 rating = float(review_info.get('reviewAverageText', '0'))
@@ -322,7 +348,11 @@ class AgentScraper(BaseScraper):
             if count_match:
                 reviews_count = int(count_match.group(1))
         if not reviews_count:
-            reviews_count = review_info.get('reviewCount') or agent_data.get('numReviews')
+            reviews_count = (
+                review_info.get('reviewCount')
+                or agent_data.get('numReviews')
+                or agent_data.get('numTotalReviews')
+            )
         
         # Extract profile data for additional info
         # Note: profileData might be a list of stats, not a dict
@@ -373,7 +403,7 @@ class AgentScraper(BaseScraper):
             agent_location = profile_data.get('location')
         
         # Get brokerage from secondaryCardTitle (e.g., "RE/Max ONE")
-        brokerage = agent_data.get('secondaryCardTitle', '')
+        brokerage = agent_data.get('secondaryCardTitle') or agent_data.get('businessName', '')
         
         # Check if this is a team
         is_team = False
@@ -400,11 +430,12 @@ class AgentScraper(BaseScraper):
             'name': name,
             'url': profile_url,
             'photo_url': photo_url,
+            'phone': agent_data.get('phoneNumber') or agent_data.get('phone', ''),
             'brokerage': brokerage,
             'location': agent_location,
             'rating': float(rating) if rating else None,
             'reviews_count': int(reviews_count) if reviews_count else None,
-            'sales_count': int(sales_count) if sales_count else None,
+            'sales_count': int(sales_count or agent_data.get('saleCountAllTime') or 0) or None,
             'price_range': price_range,
             'is_team': is_team,
         }
